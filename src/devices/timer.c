@@ -5,8 +5,10 @@
 #include <stdio.h>
 #include "devices/pit.h"
 #include "threads/interrupt.h"
+#include "threads/palloc.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include "list.h"
   
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -24,6 +26,18 @@ static int64_t ticks;
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
 
+/* Sleepers list element. We keep a separate list of sleepers ordered by
+   wakeup time. We store each sleeper in a full page (via palloc) so we
+   can safely allocate in kernel context without relying on malloc. */
+struct sleeper
+  {
+    struct list_elem elem;
+    struct thread *t;
+    int64_t wakeup;
+  };
+
+static struct list sleepers;
+
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
@@ -37,6 +51,7 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  list_init (&sleepers);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -89,11 +104,34 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  if (ticks <= 0)
+    return;
 
   ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+
+  int64_t wake = timer_ticks () + ticks;
+
+  /* Allocate a sleeper entry. */
+  struct sleeper *s = palloc_get_page (0);
+  if (s == NULL)
+    return; /* If allocation fails, fallback to busy-wait to avoid crash. */
+  s->t = thread_current ();
+  s->wakeup = wake;
+
+  enum intr_level old = intr_disable ();
+  /* Insert ordered by wakeup time (earliest first). */
+  struct list_elem *e;
+  for (e = list_begin (&sleepers); e != list_end (&sleepers); e = list_next (e))
+    {
+      struct sleeper *cur = list_entry (e, struct sleeper, elem);
+      if (s->wakeup < cur->wakeup)
+        break;
+    }
+  list_insert (e, &s->elem);
+
+  /* Block this thread until timer interrupt wakes it. */
+  thread_block ();
+  intr_set_level (old);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -171,6 +209,21 @@ static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
+
+  /* Wake any sleepers whose time has come (sleepers list is ordered). */
+  while (!list_empty (&sleepers))
+    {
+      struct sleeper *s = list_entry (list_front (&sleepers), struct sleeper, elem);
+      if (s->wakeup <= ticks)
+        {
+          list_pop_front (&sleepers);
+          thread_unblock (s->t);
+          palloc_free_page (s);
+        }
+      else
+        break;
+    }
+
   thread_tick ();
 }
 

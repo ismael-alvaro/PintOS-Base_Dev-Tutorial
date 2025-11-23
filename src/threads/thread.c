@@ -8,12 +8,122 @@
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
 #include "threads/palloc.h"
+#include "devices/timer.h"
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
+
+/* Fixed-point arithmetic: 17.14 format */
+#define FP_Q 14
+
+static int
+fp_from_int (int n)
+{
+  return n << FP_Q;
+}
+
+static int
+fp_to_int_round (int x)
+{
+  if (x >= 0)
+    return (x + (1 << (FP_Q - 1))) >> FP_Q;
+  else
+    return (x - (1 << (FP_Q - 1))) >> FP_Q;
+}
+
+static int
+fp_add (int a, int b)
+{
+  return a + b;
+}
+
+static int
+fp_sub (int a, int b)
+{
+  return a - b;
+}
+
+static int
+fp_mul (int a, int b)
+{
+  return (int) (((int64_t) a * b) >> FP_Q);
+}
+
+static int
+fp_div (int a, int b)
+{
+  return (int) (((int64_t) a << FP_Q) / b);
+}
+
+/* Helper to construct fixed-point from fraction num/den. */
+static int
+fp_from_fraction (int num, int den)
+{
+  return (num << FP_Q) / den;
+}
+
+/* Extra per-thread accounting data stored separately (we cannot
+   change thread.h). We allocate one page per extra. */
+struct thread_extra
+  {
+    struct list_elem elem;
+    struct thread *t;
+    int recent_cpu; /* fixed-point */
+    int nice;       /* integer -20..20 */
+    void *page;     /* pointer returned by palloc, to free later */
+  };
+
+static struct list extra_list;
+static int load_avg; /* fixed-point */
+static bool extra_inited = false;
+
+static struct thread_extra *
+get_extra (struct thread *t)
+{
+  struct list_elem *e;
+  for (e = list_begin (&extra_list); e != list_end (&extra_list); e = list_next (e))
+    {
+      struct thread_extra *ex = list_entry (e, struct thread_extra, elem);
+      if (ex->t == t)
+        return ex;
+    }
+  return NULL;
+}
+
+static void
+create_extra_for (struct thread *t)
+{
+  struct thread_extra *ex = palloc_get_page (0);
+  if (ex == NULL)
+    return;
+  ex->t = t;
+  ex->recent_cpu = 0;
+  ex->nice = 0;
+  ex->page = ex;
+  list_push_back (&extra_list, &ex->elem);
+}
+
+static void
+free_extra_for (struct thread *t)
+{
+  struct list_elem *e;
+  for (e = list_begin (&extra_list); e != list_end (&extra_list); e = list_next (e))
+    {
+      struct thread_extra *ex = list_entry (e, struct thread_extra, elem);
+      if (ex->t == t)
+        {
+          list_remove (&ex->elem);
+          palloc_free_page (ex->page);
+          return;
+        }
+    }
+}
+
+static void recompute_priority_for (struct thread *t);
+static void recompute_recent_cpu_for (struct thread *t, void *aux UNUSED);
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
@@ -138,6 +248,45 @@ thread_tick (void)
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
+
+  /* MLFQS accounting: update recent_cpu each tick and periodically
+     recompute load_avg, recent_cpu and priorities once per second. */
+  if (thread_mlfqs)
+    {
+      if (t != idle_thread)
+        {
+          struct thread_extra *ex = get_extra (t);
+          if (ex != NULL)
+            ex->recent_cpu = fp_add (ex->recent_cpu, fp_from_int (1));
+        }
+
+      if (timer_ticks () % TIMER_FREQ == 0)
+        {
+          /* ready_threads = size of ready_list; add running thread if not idle */
+          int ready_threads = list_size (&ready_list);
+          if (t != idle_thread)
+            ready_threads++;
+
+          /* load_avg = (59/60)*load_avg + (1/60)*ready_threads */
+          load_avg = fp_add (fp_mul (load_avg, fp_from_fraction (59, 60)),
+                              fp_mul (fp_from_int (ready_threads), fp_from_fraction (1, 60)));
+
+          /* Recompute recent_cpu for all threads. */
+          struct list_elem *e;
+          for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
+            {
+              struct thread *th = list_entry (e, struct thread, allelem);
+              recompute_recent_cpu_for (th, NULL);
+            }
+
+          /* Recompute priority for all threads. */
+          for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
+            {
+              struct thread *th = list_entry (e, struct thread, allelem);
+              recompute_priority_for (th);
+            }
+        }
+    }
 }
 
 /* Prints thread statistics. */
@@ -238,7 +387,22 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  /* Insert into ready_list ordered by priority when using MLFQS,
+     otherwise append. Higher priority threads should come first. */
+  if (thread_mlfqs)
+    {
+      struct list_elem *e;
+      int p = t->priority;
+      for (e = list_begin (&ready_list); e != list_end (&ready_list); e = list_next (e))
+        {
+          struct thread *cur = list_entry (e, struct thread, elem);
+          if (p > cur->priority)
+            break;
+        }
+      list_insert (e, &t->elem);
+    }
+  else
+    list_push_back (&ready_list, &t->elem);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -292,6 +456,8 @@ thread_exit (void)
      when it calls thread_schedule_tail(). */
   intr_disable ();
   list_remove (&thread_current()->allelem);
+  /* Free per-thread extra accounting. */
+  free_extra_for (thread_current ());
   thread_current ()->status = THREAD_DYING;
   schedule ();
   NOT_REACHED ();
@@ -308,8 +474,24 @@ thread_yield (void)
   ASSERT (!intr_context ());
 
   old_level = intr_disable ();
-  if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+  if (cur != idle_thread)
+    {
+      if (thread_mlfqs)
+        {
+          /* Insert ordered by priority. */
+          struct list_elem *e;
+          int p = cur->priority;
+          for (e = list_begin (&ready_list); e != list_end (&ready_list); e = list_next (e))
+            {
+              struct thread *c = list_entry (e, struct thread, elem);
+              if (p > c->priority)
+                break;
+            }
+          list_insert (e, &cur->elem);
+        }
+      else
+        list_push_back (&ready_list, &cur->elem);
+    }
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -336,6 +518,8 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
+  if (thread_mlfqs)
+    return; /* priorities are controlled by MLFQS */
   thread_current ()->priority = new_priority;
 }
 
@@ -350,31 +534,44 @@ thread_get_priority (void)
 void
 thread_set_nice (int nice UNUSED) 
 {
-  /* Not yet implemented. */
+  if (nice < -20)
+    nice = -20;
+  if (nice > 20)
+    nice = 20;
+  struct thread *cur = thread_current ();
+  struct thread_extra *ex = get_extra (cur);
+  if (ex == NULL)
+    return;
+  ex->nice = nice;
+  recompute_priority_for (cur);
 }
 
 /* Returns the current thread's nice value. */
 int
 thread_get_nice (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  struct thread_extra *ex = get_extra (thread_current ());
+  if (ex == NULL)
+    return 0;
+  return ex->nice;
 }
 
 /* Returns 100 times the system load average. */
 int
 thread_get_load_avg (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  /* Return 100 times load_avg. */
+  return fp_to_int_round (fp_mul (load_avg, fp_from_int (100)));
 }
 
 /* Returns 100 times the current thread's recent_cpu value. */
 int
 thread_get_recent_cpu (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  struct thread_extra *ex = get_extra (thread_current ());
+  if (ex == NULL)
+    return 0;
+  return fp_to_int_round (fp_mul (ex->recent_cpu, fp_from_int (100)));
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -467,6 +664,13 @@ init_thread (struct thread *t, const char *name, int priority)
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
+  /* Ensure extra accounting exists for this thread. */
+  if (!extra_inited)
+    {
+      list_init (&extra_list);
+      extra_inited = true;
+    }
+  create_extra_for (t);
   intr_set_level (old_level);
 }
 
@@ -583,6 +787,58 @@ allocate_tid (void)
   lock_release (&tid_lock);
 
   return tid;
+}
+
+/* Recompute recent_cpu for a thread (helper for thread_foreach). */
+static void
+recompute_recent_cpu_for (struct thread *t, void *aux UNUSED)
+{
+  if (t == idle_thread)
+    return;
+  struct thread_extra *ex = get_extra (t);
+  if (ex == NULL)
+    return;
+
+  /* coeff = (2*load_avg) / (2*load_avg + 1) */
+  int two_la = fp_add (load_avg, load_avg);
+  int denom = fp_add (two_la, fp_from_int (1));
+  int coeff = fp_div (two_la, denom);
+
+  ex->recent_cpu = fp_add (fp_mul (coeff, ex->recent_cpu), fp_from_int (ex->nice));
+}
+
+static void
+recompute_priority_for (struct thread *t)
+{
+  if (!thread_mlfqs)
+    return;
+  struct thread_extra *ex = get_extra (t);
+  if (ex == NULL)
+    return;
+
+  int newp = PRI_MAX - fp_to_int_round (ex->recent_cpu / 4) - (ex->nice * 2);
+  if (newp < PRI_MIN)
+    newp = PRI_MIN;
+  if (newp > PRI_MAX)
+    newp = PRI_MAX;
+
+  int oldp = t->priority;
+  t->priority = newp;
+
+  /* If thread is ready, reposition it in ready_list according to new priority. */
+  if (t->status == THREAD_READY)
+    {
+      /* Remove then re-insert ordered. */
+      list_remove (&t->elem);
+      struct list_elem *e;
+      for (e = list_begin (&ready_list); e != list_end (&ready_list); e = list_next (e))
+        {
+          struct thread *cur = list_entry (e, struct thread, elem);
+          if (t->priority > cur->priority)
+            break;
+        }
+      list_insert (e, &t->elem);
+    }
 }
 
 /* Offset of `stack' member within `struct thread'.
