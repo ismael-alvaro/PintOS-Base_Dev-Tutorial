@@ -208,9 +208,13 @@ thread_tick (void)
           if (t != idle_thread)
             ready_threads++;
 
-          /* load_avg = (59/60)*load_avg + (1/60)*ready_threads */
-          load_avg = fp_add (fp_mul (load_avg, fp_from_fraction (59, 60)),
-                              fp_mul (fp_from_int (ready_threads), fp_from_fraction (1, 60)));
+           /* load_avg = (59/60)*load_avg + (1/60)*ready_threads */
+           /* Use fp_div to compute exact fixed-point fractions to reduce
+             cumulative rounding error. */
+           int coef59_60 = fp_div (fp_from_int (59), fp_from_int (60));
+           int coef1_60 = fp_div (fp_from_int (1), fp_from_int (60));
+           load_avg = fp_add (fp_mul (coef59_60, load_avg),
+                        fp_mul (coef1_60, fp_from_int (ready_threads)));
 
           /* Recompute recent_cpu for all threads. */
           struct list_elem *e;
@@ -737,7 +741,10 @@ recompute_priority_for (struct thread *t)
 {
   if (!thread_mlfqs)
     return;
-  int newp = PRI_MAX - fp_to_int_round (t->recent_cpu / 4) - (t->nice * 2);
+    /* priority = PRI_MAX - (recent_cpu / 4) - (nice * 2)
+      Use fp_div to divide recent_cpu by 4 in fixed-point. */
+    int recent_div4 = fp_div (t->recent_cpu, fp_from_int (4));
+    int newp = PRI_MAX - fp_to_int_round (recent_div4) - (t->nice * 2);
   if (newp < PRI_MIN)
     newp = PRI_MIN;
   if (newp > PRI_MAX)
