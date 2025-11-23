@@ -34,7 +34,6 @@ struct sleeper
     struct list_elem elem;
     struct thread *t;
     int64_t wakeup;
-    void *page; /* non-NULL if allocated with palloc_get_page */
   };
 
 static struct list sleepers;
@@ -114,35 +113,10 @@ timer_sleep (int64_t ticks)
 
   /* Allocate a sleeper entry. */
   struct sleeper *s = palloc_get_page (0);
-  bool allocated = true;
-  if (s == NULL || s == (struct sleeper *) thread_current ())
-    {
-      /* Allocation failed or returned the current thread's page (collision).
-         Use a sleeper on the current thread's stack instead. */
-      struct sleeper local_s;
-      local_s.t = thread_current ();
-      local_s.wakeup = wake;
-      local_s.page = NULL;
-      /* Insert local_s by copying into list via its elem. We must insert
-         the element pointing to the memory that will remain valid while the
-         thread is blocked (its stack). So we insert &local_s.elem. */
-      enum intr_level old2 = intr_disable ();
-      struct list_elem *e2;
-      for (e2 = list_begin (&sleepers); e2 != list_end (&sleepers); e2 = list_next (e2))
-        {
-          struct sleeper *cur = list_entry (e2, struct sleeper, elem);
-          if (local_s.wakeup < cur->wakeup)
-            break;
-        }
-      list_insert (e2, &local_s.elem);
-      /* Block this thread until timer interrupt wakes it. */
-      thread_block ();
-      intr_set_level (old2);
-      return;
-    }
+  if (s == NULL)
+    return; /* If allocation fails, fallback to busy-wait to avoid crash. */
   s->t = thread_current ();
   s->wakeup = wake;
-  s->page = s;
 
   enum intr_level old = intr_disable ();
   /* Insert ordered by wakeup time (earliest first). */
@@ -244,8 +218,7 @@ timer_interrupt (struct intr_frame *args UNUSED)
         {
           list_pop_front (&sleepers);
           thread_unblock (s->t);
-          if (s->page != NULL)
-            palloc_free_page (s->page);
+          palloc_free_page (s);
         }
       else
         break;

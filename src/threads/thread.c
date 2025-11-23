@@ -79,7 +79,6 @@ struct thread_extra
 static struct list extra_list;
 static int load_avg; /* fixed-point */
 static bool extra_inited = false;
-static struct thread_extra initial_thread_extra;
 
 static struct thread_extra *
 get_extra (struct thread *t)
@@ -97,22 +96,13 @@ get_extra (struct thread *t)
 static void
 create_extra_for (struct thread *t)
 {
-  struct thread_extra *ex;
-  if (t == initial_thread)
-    {
-      ex = &initial_thread_extra;
-      ex->page = NULL; /* not palloc'd */
-    }
-  else
-    {
-      ex = palloc_get_page (0);
-      if (ex == NULL)
-        return;
-      ex->page = ex;
-    }
+  struct thread_extra *ex = palloc_get_page (0);
+  if (ex == NULL)
+    return;
   ex->t = t;
   ex->recent_cpu = 0;
   ex->nice = 0;
+  ex->page = ex;
   list_push_back (&extra_list, &ex->elem);
 }
 
@@ -126,8 +116,7 @@ free_extra_for (struct thread *t)
       if (ex->t == t)
         {
           list_remove (&ex->elem);
-          if (ex->page != NULL)
-            palloc_free_page (ex->page);
+          palloc_free_page (ex->page);
           return;
         }
     }
