@@ -65,65 +65,10 @@ fp_from_fraction (int num, int den)
   return (num << FP_Q) / den;
 }
 
-/* Extra per-thread accounting data stored separately (we cannot
-   change thread.h). We allocate one page per extra. */
-struct thread_extra
-  {
-    struct list_elem elem;
-    struct thread *t;
-    int recent_cpu; /* fixed-point */
-    int nice;       /* integer -20..20 */
-    void *page;     /* pointer returned by palloc, to free later */
-  };
-
-static struct list extra_list;
 static int load_avg; /* fixed-point */
-static bool extra_inited = false;
-
-static struct thread_extra *
-get_extra (struct thread *t)
-{
-  struct list_elem *e;
-  for (e = list_begin (&extra_list); e != list_end (&extra_list); e = list_next (e))
-    {
-      struct thread_extra *ex = list_entry (e, struct thread_extra, elem);
-      if (ex->t == t)
-        return ex;
-    }
-  return NULL;
-}
-
-static void
-create_extra_for (struct thread *t)
-{
-  struct thread_extra *ex = palloc_get_page (0);
-  if (ex == NULL)
-    return;
-  ex->t = t;
-  ex->recent_cpu = 0;
-  ex->nice = 0;
-  ex->page = ex;
-  list_push_back (&extra_list, &ex->elem);
-}
-
-static void
-free_extra_for (struct thread *t)
-{
-  struct list_elem *e;
-  for (e = list_begin (&extra_list); e != list_end (&extra_list); e = list_next (e))
-    {
-      struct thread_extra *ex = list_entry (e, struct thread_extra, elem);
-      if (ex->t == t)
-        {
-          list_remove (&ex->elem);
-          palloc_free_page (ex->page);
-          return;
-        }
-    }
-}
 
 static void recompute_priority_for (struct thread *t);
-static void recompute_recent_cpu_for (struct thread *t, void *aux UNUSED);
+static void recompute_recent_cpu_for (struct thread *t);
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
@@ -254,11 +199,7 @@ thread_tick (void)
   if (thread_mlfqs)
     {
       if (t != idle_thread)
-        {
-          struct thread_extra *ex = get_extra (t);
-          if (ex != NULL)
-            ex->recent_cpu = fp_add (ex->recent_cpu, fp_from_int (1));
-        }
+        t->recent_cpu = fp_add (t->recent_cpu, fp_from_int (1));
 
       if (timer_ticks () % TIMER_FREQ == 0)
         {
@@ -276,7 +217,7 @@ thread_tick (void)
           for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
             {
               struct thread *th = list_entry (e, struct thread, allelem);
-              recompute_recent_cpu_for (th, NULL);
+              recompute_recent_cpu_for (th);
             }
 
           /* Recompute priority for all threads. */
@@ -456,8 +397,6 @@ thread_exit (void)
      when it calls thread_schedule_tail(). */
   intr_disable ();
   list_remove (&thread_current()->allelem);
-  /* Free per-thread extra accounting. */
-  free_extra_for (thread_current ());
   thread_current ()->status = THREAD_DYING;
   schedule ();
   NOT_REACHED ();
@@ -539,10 +478,7 @@ thread_set_nice (int nice UNUSED)
   if (nice > 20)
     nice = 20;
   struct thread *cur = thread_current ();
-  struct thread_extra *ex = get_extra (cur);
-  if (ex == NULL)
-    return;
-  ex->nice = nice;
+  cur->nice = nice;
   recompute_priority_for (cur);
 }
 
@@ -550,10 +486,7 @@ thread_set_nice (int nice UNUSED)
 int
 thread_get_nice (void) 
 {
-  struct thread_extra *ex = get_extra (thread_current ());
-  if (ex == NULL)
-    return 0;
-  return ex->nice;
+  return thread_current ()->nice;
 }
 
 /* Returns 100 times the system load average. */
@@ -568,10 +501,8 @@ thread_get_load_avg (void)
 int
 thread_get_recent_cpu (void) 
 {
-  struct thread_extra *ex = get_extra (thread_current ());
-  if (ex == NULL)
-    return 0;
-  return fp_to_int_round (fp_mul (ex->recent_cpu, fp_from_int (100)));
+  struct thread *cur = thread_current ();
+  return fp_to_int_round (fp_mul (cur->recent_cpu, fp_from_int (100)));
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -664,13 +595,10 @@ init_thread (struct thread *t, const char *name, int priority)
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
-  /* Ensure extra accounting exists for this thread. */
-  if (!extra_inited)
-    {
-      list_init (&extra_list);
-      extra_inited = true;
-    }
-  create_extra_for (t);
+  /* Initialize MLFQS fields stored in struct thread. */
+  t->recent_cpu = 0;
+  t->nice = 0;
+  t->wakeup = 0;
   intr_set_level (old_level);
 }
 
@@ -791,12 +719,9 @@ allocate_tid (void)
 
 /* Recompute recent_cpu for a thread (helper for thread_foreach). */
 static void
-recompute_recent_cpu_for (struct thread *t, void *aux UNUSED)
+recompute_recent_cpu_for (struct thread *t)
 {
   if (t == idle_thread)
-    return;
-  struct thread_extra *ex = get_extra (t);
-  if (ex == NULL)
     return;
 
   /* coeff = (2*load_avg) / (2*load_avg + 1) */
@@ -804,7 +729,7 @@ recompute_recent_cpu_for (struct thread *t, void *aux UNUSED)
   int denom = fp_add (two_la, fp_from_int (1));
   int coeff = fp_div (two_la, denom);
 
-  ex->recent_cpu = fp_add (fp_mul (coeff, ex->recent_cpu), fp_from_int (ex->nice));
+  t->recent_cpu = fp_add (fp_mul (coeff, t->recent_cpu), fp_from_int (t->nice));
 }
 
 static void
@@ -812,11 +737,7 @@ recompute_priority_for (struct thread *t)
 {
   if (!thread_mlfqs)
     return;
-  struct thread_extra *ex = get_extra (t);
-  if (ex == NULL)
-    return;
-
-  int newp = PRI_MAX - fp_to_int_round (ex->recent_cpu / 4) - (ex->nice * 2);
+  int newp = PRI_MAX - fp_to_int_round (t->recent_cpu / 4) - (t->nice * 2);
   if (newp < PRI_MIN)
     newp = PRI_MIN;
   if (newp > PRI_MAX)

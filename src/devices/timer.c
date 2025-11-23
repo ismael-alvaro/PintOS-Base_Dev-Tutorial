@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include "devices/pit.h"
 #include "threads/interrupt.h"
-#include "threads/palloc.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "list.h"
@@ -26,16 +25,8 @@ static int64_t ticks;
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
 
-/* Sleepers list element. We keep a separate list of sleepers ordered by
-   wakeup time. We store each sleeper in a full page (via palloc) so we
-   can safely allocate in kernel context without relying on malloc. */
-struct sleeper
-  {
-    struct list_elem elem;
-    struct thread *t;
-    int64_t wakeup;
-  };
-
+/* List of sleeping threads, ordered by wakeup tick. We reuse each
+   thread's `elem` for this list while the thread is blocked. */
 static struct list sleepers;
 
 static intr_handler_func timer_interrupt;
@@ -111,23 +102,19 @@ timer_sleep (int64_t ticks)
 
   int64_t wake = timer_ticks () + ticks;
 
-  /* Allocate a sleeper entry. */
-  struct sleeper *s = palloc_get_page (0);
-  if (s == NULL)
-    return; /* If allocation fails, fallback to busy-wait to avoid crash. */
-  s->t = thread_current ();
-  s->wakeup = wake;
-
   enum intr_level old = intr_disable ();
+  struct thread *cur = thread_current ();
+  cur->wakeup = wake;
+
   /* Insert ordered by wakeup time (earliest first). */
   struct list_elem *e;
   for (e = list_begin (&sleepers); e != list_end (&sleepers); e = list_next (e))
     {
-      struct sleeper *cur = list_entry (e, struct sleeper, elem);
-      if (s->wakeup < cur->wakeup)
+      struct thread *t = list_entry (e, struct thread, elem);
+      if (cur->wakeup < t->wakeup)
         break;
     }
-  list_insert (e, &s->elem);
+  list_insert (e, &cur->elem);
 
   /* Block this thread until timer interrupt wakes it. */
   thread_block ();
@@ -213,12 +200,11 @@ timer_interrupt (struct intr_frame *args UNUSED)
   /* Wake any sleepers whose time has come (sleepers list is ordered). */
   while (!list_empty (&sleepers))
     {
-      struct sleeper *s = list_entry (list_front (&sleepers), struct sleeper, elem);
-      if (s->wakeup <= ticks)
+      struct thread *t = list_entry (list_front (&sleepers), struct thread, elem);
+      if (t->wakeup <= ticks)
         {
           list_pop_front (&sleepers);
-          thread_unblock (s->t);
-          palloc_free_page (s);
+          thread_unblock (t);
         }
       else
         break;

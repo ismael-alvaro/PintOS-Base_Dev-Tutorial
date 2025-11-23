@@ -90,6 +90,11 @@ struct thread
     int priority;                       /* Priority. */
     struct list_elem allelem;           /* List element for all threads list. */
 
+   /* MLFQS and timer fields */
+   int recent_cpu;                     /* Recent CPU, fixed-point 17.14 */
+   int nice;                           /* Nice value, -20..20 */
+   int64_t wakeup;                     /* Tick to wake up (used by timer_sleep) */
+
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
 
