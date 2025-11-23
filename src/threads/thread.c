@@ -630,8 +630,6 @@ next_thread_to_run (void)
 static void
 schedule (void) 
 {
-  /* Minimal implementation: select next thread and context switch.
-     Use existing PintOS schedule implementation in your tree. */
   struct thread *cur = running_thread ();
   struct thread *next = next_thread_to_run ();
   struct thread *prev = NULL;
@@ -642,6 +640,33 @@ schedule (void)
     prev = cur;
 
   thread_schedule_tail (prev);
+}
+
+/* Completes a thread switch. Called after switch_threads() returns. */
+void
+thread_schedule_tail (struct thread *prev)
+{
+  struct thread *cur = running_thread ();
+
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  /* Mark us as running. */
+  cur->status = THREAD_RUNNING;
+
+  /* Reset per-thread slice counter. */
+  thread_ticks = 0;
+
+#ifdef USERPROG
+  /* Activate the new address space. */
+  process_activate ();
+#endif
+
+  /* If the previous thread is dying, free its memory. */
+  if (prev != NULL && prev->status == THREAD_DYING)
+    {
+      ASSERT (prev != cur);
+      palloc_free_page (prev);
+    }
 }
 
 /* Returns a tid to use for a new thread. */
