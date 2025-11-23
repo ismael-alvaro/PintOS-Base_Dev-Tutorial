@@ -19,14 +19,6 @@
 /* Fixed-point arithmetic: 17.14 format */
 #define FP_Q 14
 
-static bool thread_priority_cmp (const struct list_elem *a,
-                                 const struct list_elem *b, void *aux UNUSED)
-{
-  const struct thread *ta = list_entry (a, struct thread, elem);
-  const struct thread *tb = list_entry (b, struct thread, elem);
-  return ta->priority > tb->priority;
-}
-
 static int
 fp_from_int (int n)
 {
@@ -72,10 +64,6 @@ fp_from_fraction (int num, int den)
 {
   return (num << FP_Q) / den;
 }
-
-static int fp_mul_int (int a, int n) { return a * n; }
-static int fp_div_int (int a, int n) { return a / n; }
-static int fp_add_int (int a, int n) { return a + (n << FP_Q); }
 
 static int load_avg; /* fixed-point */
 
@@ -164,68 +152,41 @@ thread_tick (void)
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
 
-  /* --- MLFQS per-tick accounting: increment recent_cpu of running thread --- */
   if (thread_mlfqs)
     {
-      struct thread *t = thread_current ();
       if (t != idle_thread)
-        t->recent_cpu = fp_add_int (t->recent_cpu, 1); /* +1 (fix-point) per tick */
+        t->recent_cpu = fp_add (t->recent_cpu, fp_from_int (1));
+
+      if (timer_ticks () % TIMER_FREQ == 0)
+        {
+          int ready = list_size (&ready_list);
+          /* NOTE: corrigido: não adicionamos +1 aqui (contagem deve ser número de threads ready) */
+
+          /* load_avg = (59/60)*load_avg + (1/60)*ready */
+          int coeff1 = fp_div (fp_from_int (59), fp_from_int (60));
+          int coeff2 = fp_div (fp_from_int (1), fp_from_int (60));
+          load_avg = fp_add (fp_mul (coeff1, load_avg), fp_mul (coeff2, fp_from_int (ready)));
+
+          struct list_elem *e;
+          for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
+            {
+              struct thread *th = list_entry (e, struct thread, allelem);
+              if (th == idle_thread)
+                continue;
+              int two_la = fp_mul (fp_from_int (2), load_avg);
+              int coeff = fp_div (two_la, fp_add (two_la, fp_from_int (1)));
+              th->recent_cpu = fp_add (fp_mul (coeff, th->recent_cpu), fp_from_int (th->nice));
+            }
+
+          for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
+            {
+              struct thread *th = list_entry (e, struct thread, allelem);
+              if (th == idle_thread)
+                continue;
+              recompute_priority_for (th);
+            }
+        }
     }
-
-  /* --- Every second: recompute load_avg, recent_cpu for all threads, and priorities --- */
-if (thread_mlfqs && ticks % TIMER_FREQ == 0)
-  {
-    /* ready_threads = size(ready_list) + (current != idle) */
-    int ready = list_size (&ready_list);
-    if (thread_current () != idle_thread)
-      ready++;
-
-    /* load_avg = (59/60)*load_avg + (1/60)*ready
-       Using fixed-point: load_avg = (59*load_avg + ready) / 60
-    */
-    load_avg = fp_div_int (fp_add (fp_mul_int (load_avg, 59),
-                                   fp_from_int (ready)),
-                           60);
-
-    /* recompute recent_cpu for every thread (skip idle) */
-    struct list_elem *e;
-    for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
-      {
-        struct thread *t = list_entry (e, struct thread, allelem);
-        if (t == idle_thread)
-          continue;
-
-        /* coef = (2*load_avg) / (2*load_avg + 1) */
-        int two_load = fp_mul_int (load_avg, 2);
-        int coef = fp_div (two_load, fp_add_int (two_load, 1));
-        t->recent_cpu = fp_add (fp_mul (coef, t->recent_cpu),
-                                fp_from_int (t->nice));
-      }
-
-    /* recompute priority for all threads and, if in ready state, reorder ready_list */
-    for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
-      {
-        struct thread *t = list_entry (e, struct thread, allelem);
-        if (t == idle_thread)
-          continue;
-
-        int old_pr = t->priority;
-        int new_pr = PRI_MAX - fp_to_int_round (fp_div_int (t->recent_cpu, 4))
-                     - (t->nice * 2);
-        if (new_pr > PRI_MAX)
-          new_pr = PRI_MAX;
-        if (new_pr < PRI_MIN)
-          new_pr = PRI_MIN;
-        t->priority = new_pr;
-
-        if (t->status == THREAD_READY)
-          {
-            /* remove and reinsert ordered by priority so ready_list reflects new priorities */
-            list_remove (&t->elem);
-            list_insert_ordered (&ready_list, &t->elem, thread_priority_cmp, NULL);
-          }
-      }
-  }
 }
 
 void
