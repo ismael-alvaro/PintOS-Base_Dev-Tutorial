@@ -1,6 +1,6 @@
 # PintOS - Development Base
 
-**[PT-BR](#pt-br) | [EN](#en)**
+**PT-BR | [EN](#en)**
 
 ---
 
