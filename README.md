@@ -109,7 +109,7 @@ Veja LICENSE no diretório src/.
 
 ### 🙏 Agradecimentos
 
-- [Stanford Computer Systems Laboratory](https://web.stanford.edu/class/cs140/)
+- Stanford Computer Systems Laboratory
 - Projeto PintOS original pela Universidade de Stanford
 
 ---
@@ -219,5 +219,5 @@ See LICENSE in src/ directory.
 
 ### 🙏 Acknowledgments
 
-- [Stanford Computer Systems Laboratory](https://web.stanford.edu/class/cs140/)
+- Stanford Computer Systems Laboratory
 - Original PintOS project by Stanford University
